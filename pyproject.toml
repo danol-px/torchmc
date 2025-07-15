@@ -1,0 +1,10 @@
+[project]
+name = "torchmc"
+version = "0.0.1"
+description = "HMC in PyTorch, with an emphasis on parallel computation."
+dependencies = [
+    "torch",
+    "numpy",
+    "matplotlib",
+    "tqdm",
+]
