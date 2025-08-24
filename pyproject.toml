@@ -1,10 +1,25 @@
+[build-system]
+requires = [ "setuptools",]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "torchmc"
-version = "0.0.1"
-description = "HMC in PyTorch, with an emphasis on parallel computation."
+version = "0.0.0"
 dependencies = [
     "torch",
     "numpy",
     "matplotlib",
     "tqdm",
 ]
+
+[project.optional-dependencies]
+bench = [
+    "corner",
+    "pyro-ppl",
+    "tensorflow_probability[tf]",
+    "emcee",
+]
+
+[tool.setuptools.packages.find]
+where = [ ".",]
+namespaces = false

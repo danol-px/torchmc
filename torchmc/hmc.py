@@ -4,9 +4,9 @@ from typing import Callable, Tuple
 
 import torch
 
-from integrators import leapfrog
-from adaption import StepSizeAdaptor, TrajectoryLengthAdaptor
-from tqdm import tqdm
+from torchmc.integrator import leapfrog
+from torchmc.adaption import ChEESAdaption
+from tqdm.auto import trange
 
 
 class HMC:
@@ -23,26 +23,22 @@ class HMC:
             log_prob_fn: Function that takes (n_chains, n_dims) and returns (n_chains,)
             initial_state: Initial positions (n_chains, n_dims)
         """
-        if (
-            initial_state.ndim != 2
-            or log_prob_fn(initial_state).ndim != 1
-            or log_prob_fn(initial_state).shape[0] != initial_state.shape[0]
-        ):
+        if initial_state.ndim != 2:
+            raise ValueError("Initial state must be shape (n_chains, n_dims)")
+        if (_log_p := log_prob_fn(initial_state)).ndim != 1 or _log_p.shape[0] != initial_state.shape[0]:
             raise ValueError("log_prob_fn must return a 1D tensor of shape (n_chains,)")
 
         self.log_prob_fn = log_prob_fn
         self.n_chains, self.n_dims = initial_state.shape
         self.device = initial_state.device
-        self.inv_mass = torch.eye(self.n_dims, device=self.device)
+
         self.chain = [initial_state.clone()]
-        self.warmup_mask = [False]
+        self.n_warmup = None
         self.mean_acceptance = 0.0
 
         self.set_initial_step_size(initial_state)
-        self.step_size_adaptor = StepSizeAdaptor(self.step_size)
-
-        self.trajectory_length = 6.14
-        self.trajectory_length_adaptor = TrajectoryLengthAdaptor()
+        self.trajectory_length = self.step_size
+        self.adaptor = ChEESAdaption(initial_step_size=self.step_size)
 
     def hamiltonian(
         self, position: torch.Tensor, momentum: torch.Tensor
@@ -56,9 +52,7 @@ class HMC:
         Returns:
             Hamiltonian values (n_chains,)
         """
-        ke = 0.5 * torch.einsum("bd,dd,bd->b", momentum, self.inv_mass, momentum)
-        pe = -self.log_prob_fn(position)
-        return ke + pe
+        return 0.5 * torch.sum(momentum**2, dim=1) - self.log_prob_fn(position)
 
     def propose(
         self, position: torch.Tensor, momentum: torch.Tensor, n_steps: int
@@ -73,14 +67,12 @@ class HMC:
         Returns:
             Tuple of (position_proposal, acceptance_probabilities)
         """
-
         position_proposal, momentum_proposal = leapfrog(
             start_position=position,
             start_momentum=momentum,
             step_size=self.step_size,
             n_steps=n_steps,
             log_prob_fn=self.log_prob_fn,
-            inv_mass=self.inv_mass,
         )
 
         H_current = self.hamiltonian(position, momentum)
@@ -99,52 +91,45 @@ class HMC:
             n_samples: Number of samples to generate
             n_warmup: Number of warmup iterations, defaults to 0
         """
-        pbar = tqdm(range(1, n_warmup + n_samples + 1), unit="step")
+        if self.n_warmup is not None and n_warmup != 0:
+            raise ValueError("It is not valid to adapt state after sampling has started.")
+
+        self.n_warmup = self.n_warmup or n_warmup
+
+        pbar = trange(1, n_warmup + n_samples + 1, unit="step")
         for i in pbar:
-
-            # Get jittered trajectory length for this iteration
-            jittered_trajectory_length = self.trajectory_length_adaptor.get_jittered_trajectory_length()
-            
+            last_state = self.chain[-1]
             momentum = self.sample_momentum()
-            position_proposal, acceptance_probabilities, diverging = self.propose(
-                self.chain[-1], momentum, max(1, int(jittered_trajectory_length / self.step_size))
-            )
-            accepted_mask = (
-                torch.rand(self.n_chains, device=self.device) < acceptance_probabilities
-            )
-            self.chain.append(
-                torch.where(accepted_mask.unsqueeze(-1), position_proposal, self.chain[-1])
-            )
-            self.mean_acceptance += (acceptance_probabilities.mean().item() - self.mean_acceptance) / i
+            jittered_trajectory_length = self.trajectory_length * self.adaptor.jitter_factor(i)
+            n_steps = max(1, int(jittered_trajectory_length / self.step_size))
 
-            if i < n_warmup:
-                pbar.set_description(
-                    f"Stage: Warmup | Accept rate: {(self.mean_acceptance):.3f} | Step size: {self.step_size:.3f} | TL: {self.trajectory_length:.3f}"
-                )
-                self.step_size = self.step_size_adaptor(i, acceptance_probabilities)
-                # Update trajectory length using the adaptor (pass base length, not jittered)
-                self.trajectory_length = self.trajectory_length_adaptor(
+            position_proposal, acceptance_probs, diverging = self.propose(
+                position=last_state, momentum=momentum, n_steps=n_steps
+            )
+
+            accepted = torch.rand(self.n_chains, device=self.device) < acceptance_probs
+            new_state = torch.where(accepted.unsqueeze(-1), position_proposal, last_state)
+            self.chain.append(new_state)
+            self.mean_acceptance += (acceptance_probs.mean().item() - self.mean_acceptance) / i
+
+            if i <= n_warmup:
+                self.step_size, self.trajectory_length = self.adaptor(
                     iteration=i,
                     proposal=position_proposal,
-                    last_state=self.chain[-2],
+                    last_state=last_state,
                     momentum=momentum,
-                    acceptance_probabilities=acceptance_probabilities,
+                    acceptance_probabilities=acceptance_probs,
                     trajectory_length=self.trajectory_length,
                     diverging=diverging,
                 )
-                self.warmup_mask.append(False)
+            elif i == n_warmup + 1:
+                self.step_size, self.trajectory_length = self.adaptor.finalize()
 
-            elif i == n_warmup:
-                self.n_accepted = 0
-                self.n_proposed = 0
-                self.step_size = self.step_size_adaptor.final_step_size
-                self.warmup_mask.append(False)
-
-            else:
-                pbar.set_description(
-                    f"Stage: Sampling | Accept rate: {self.mean_acceptance:.3f} | Step size: {self.step_size:.3f} | TL: {self.trajectory_length:.3f}"
-                )
-                self.warmup_mask.append(True)
+            stage = "Warmup" if i <= n_warmup else "Sampling"
+            pbar.set_description(
+                f"{stage} | Accept rate: {self.mean_acceptance:.3f} | "
+                f"Step size: {self.step_size:.3e} | Trajectory length: {self.trajectory_length:.3e}"
+            )
 
         return self.get_chain()
 
@@ -157,31 +142,28 @@ class HMC:
             include_warmup: If True, include warmup samples in the chain
 
         Returns:
-            Tensor of shape (n_samples, n_chains, n_dims)
+            Tensor of shape (n_chains, n_samples, n_dims)
         """
-        chain = torch.stack(self.chain, dim=0)
+        chain = torch.stack(self.chain, dim=1)
         if not include_warmup:
-            chain = chain[self.warmup_mask]
-        chain = chain[::thin]
+            chain = chain[:, self.n_warmup + 1:, :]  # +1 for initial state
+        chain = chain[:, ::thin, :]
         if flat:
             chain = chain.view(-1, self.n_dims)
         return chain
 
     def sample_momentum(self) -> torch.Tensor:
         """Sample momentum."""
-        return torch.randn(
-            self.n_chains, self.n_dims, device=self.device
-        ) @ torch.linalg.cholesky(self.inv_mass)
+        return torch.randn(self.n_chains, self.n_dims, device=self.device)
 
     def set_initial_step_size(self, position: torch.Tensor):
         """Source: https://arxiv.org/pdf/1111.4246 (Algorithm 4)."""
 
-        self.step_size = 0.1
+        self.step_size = 1
         momentum = self.sample_momentum()
 
         acceptance_probabilities = self.propose(position, momentum, 1)[1].mean().item()
-        alpha = 2 * int(acceptance_probabilities > 0.5) - 1
 
-        while acceptance_probabilities**alpha > 2**-alpha:
-            self.step_size = 2**alpha * self.step_size
+        while acceptance_probabilities < 0.5:
+            self.step_size *= 0.5
             acceptance_probabilities = self.propose(position, momentum, 1)[1].mean().item()
