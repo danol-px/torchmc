@@ -16,8 +16,9 @@ dependencies = [
 bench = [
     "corner",
     "pyro-ppl",
-    "tensorflow_probability[tf]",
     "emcee",
+    "tensorflow_probability[tf]",
+    "tensorflow_datasets",
 ]
 
 [tool.setuptools.packages.find]
